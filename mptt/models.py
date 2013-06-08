@@ -2,11 +2,13 @@ from __future__ import unicode_literals
 from functools import reduce
 import operator
 import threading
+import sys
 import warnings
 
-from django.db import models
+from django.db import models, transaction, connection
 from django.db.models.base import ModelBase
 from django.db.models.query import Q
+
 
 from django.utils import six
 from django.utils.translation import ugettext as _
@@ -734,140 +736,150 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         tree option set, the node will be inserted or moved to the
         appropriate position to maintain ordering by the specified field.
         """
-        do_updates = self.__class__._mptt_updates_enabled
-        track_updates = self.__class__._mptt_is_tracking
+        def _save():
+            # len(self.__class__.objects.select_for_update())
+            do_updates = self.__class__._mptt_updates_enabled
+            track_updates = self.__class__._mptt_is_tracking
+            opts = self._mptt_meta
 
-        opts = self._mptt_meta
+            if not (do_updates or track_updates):
+                # inside manager.disable_mptt_updates(), don't do any updates.
+                # unless we're also inside TreeManager.delay_mptt_updates()
+                if self._mpttfield('left') is None:
+                    # we need to set *some* values, though don't care too much what.
+                    parent = getattr(self, '_%s_cache' % opts.parent_attr, None)
+                    # if we have a cached parent, have a stab at getting possibly-correct values.
+                    # otherwise, meh.
+                    if parent:
+                        left = parent._mpttfield('left') + 1
+                        setattr(self, opts.left_attr, left)
+                        setattr(self, opts.right_attr, left + 1)
+                        setattr(self, opts.level_attr, parent._mpttfield('level') + 1)
+                        setattr(self, opts.tree_id_attr, parent._mpttfield('tree_id'))
+                        self._tree_manager._post_insert_update_cached_parent_right(parent, 2)
+                    else:
+                        setattr(self, opts.left_attr, 1)
+                        setattr(self, opts.right_attr, 2)
+                        setattr(self, opts.level_attr, 0)
+                        setattr(self, opts.tree_id_attr, 0)
+                return super(MPTTModel, self).save(*args, **kwargs)
 
-        if not (do_updates or track_updates):
-            # inside manager.disable_mptt_updates(), don't do any updates.
-            # unless we're also inside TreeManager.delay_mptt_updates()
-            if self._mpttfield('left') is None:
-                # we need to set *some* values, though don't care too much what.
-                parent = getattr(self, '_%s_cache' % opts.parent_attr, None)
-                # if we have a cached parent, have a stab at getting possibly-correct values.
-                # otherwise, meh.
-                if parent:
+            parent_id = opts.get_raw_field_value(self, opts.parent_attr)
+
+            # determine whether this instance is already in the db
+            force_update = kwargs.get('force_update', False)
+            force_insert = kwargs.get('force_insert', False)
+            collapse_old_tree = None
+            if force_update or (not force_insert and self._is_saved(using=kwargs.get('using'))):
+                # it already exists, so do a move
+                old_parent_id = self._mptt_cached_fields[opts.parent_attr]
+                same_order = old_parent_id == parent_id
+                if same_order and len(self._mptt_cached_fields) > 1:
+                    get_raw_field_value = opts.get_raw_field_value
+                    for field_name, old_value in self._mptt_cached_fields.items():
+                        if old_value != get_raw_field_value(self, field_name):
+                            same_order = False
+                            break
+                    if not do_updates and not same_order:
+                        same_order = True
+                        self.__class__._mptt_track_tree_modified(self._mpttfield('tree_id'))
+                elif (not do_updates) and not same_order and old_parent_id is None:
+                    # the old tree no longer exists, so we need to collapse it.
+                    collapse_old_tree = self._mpttfield('tree_id')
+                    parent = getattr(self, opts.parent_attr)
+                    tree_id = parent._mpttfield('tree_id')
                     left = parent._mpttfield('left') + 1
+                    self.__class__._mptt_track_tree_modified(tree_id)
+                    setattr(self, opts.tree_id_attr, tree_id)
                     setattr(self, opts.left_attr, left)
                     setattr(self, opts.right_attr, left + 1)
                     setattr(self, opts.level_attr, parent._mpttfield('level') + 1)
-                    setattr(self, opts.tree_id_attr, parent._mpttfield('tree_id'))
-                    self._tree_manager._post_insert_update_cached_parent_right(parent, 2)
-                else:
-                    setattr(self, opts.left_attr, 1)
-                    setattr(self, opts.right_attr, 2)
-                    setattr(self, opts.level_attr, 0)
-                    setattr(self, opts.tree_id_attr, 0)
-            return super(MPTTModel, self).save(*args, **kwargs)
-
-        parent_id = opts.get_raw_field_value(self, opts.parent_attr)
-
-        # determine whether this instance is already in the db
-        force_update = kwargs.get('force_update', False)
-        force_insert = kwargs.get('force_insert', False)
-        collapse_old_tree = None
-        if force_update or (not force_insert and self._is_saved(using=kwargs.get('using'))):
-            # it already exists, so do a move
-            old_parent_id = self._mptt_cached_fields[opts.parent_attr]
-            same_order = old_parent_id == parent_id
-            if same_order and len(self._mptt_cached_fields) > 1:
-                get_raw_field_value = opts.get_raw_field_value
-                for field_name, old_value in self._mptt_cached_fields.items():
-                    if old_value != get_raw_field_value(self, field_name):
-                        same_order = False
-                        break
-                if not do_updates and not same_order:
                     same_order = True
-                    self.__class__._mptt_track_tree_modified(self._mpttfield('tree_id'))
-            elif (not do_updates) and not same_order and old_parent_id is None:
-                # the old tree no longer exists, so we need to collapse it.
-                collapse_old_tree = self._mpttfield('tree_id')
-                parent = getattr(self, opts.parent_attr)
-                tree_id = parent._mpttfield('tree_id')
-                left = parent._mpttfield('left') + 1
-                self.__class__._mptt_track_tree_modified(tree_id)
-                setattr(self, opts.tree_id_attr, tree_id)
-                setattr(self, opts.left_attr, left)
-                setattr(self, opts.right_attr, left + 1)
-                setattr(self, opts.level_attr, parent._mpttfield('level') + 1)
-                same_order = True
 
-            if not same_order:
-                opts.set_raw_field_value(self, opts.parent_attr, old_parent_id)
-                try:
-                    right_sibling = None
-                    if opts.order_insertion_by:
-                        right_sibling = opts.get_ordered_insertion_target(self, getattr(self, opts.parent_attr))
+                if not same_order:
+                    opts.set_raw_field_value(self, opts.parent_attr, old_parent_id)
+                    try:
+                        right_sibling = None
+                        if opts.order_insertion_by:
+                            right_sibling = opts.get_ordered_insertion_target(self, getattr(self, opts.parent_attr))
 
-                    if parent_id is not None:
-                        parent = getattr(self, opts.parent_attr)
-                        # If we aren't already a descendant of the new parent, we need to update the parent.rght so
-                        # things like get_children and get_descendant_count work correctly.
-                        update_cached_parent = (
-                            getattr(self, opts.tree_id_attr) != getattr(parent, opts.tree_id_attr) or
-                            getattr(self, opts.left_attr) < getattr(parent, opts.left_attr) or
-                            getattr(self, opts.right_attr) > getattr(parent, opts.right_attr))
+                        if parent_id is not None:
+                            parent = getattr(self, opts.parent_attr)
+                            # If we aren't already a descendant of the new parent, we need to update the parent.rght so
+                            # things like get_children and get_descendant_count work correctly.
+                            update_cached_parent = (
+                                getattr(self, opts.tree_id_attr) != getattr(parent, opts.tree_id_attr) or
+                                getattr(self, opts.left_attr) < getattr(parent, opts.left_attr) or
+                                getattr(self, opts.right_attr) > getattr(parent, opts.right_attr))
 
-                    if right_sibling:
-                        self._tree_manager._move_node(self, right_sibling, 'left', save=False)
-                    else:
-                        # Default movement
-                        if parent_id is None:
-                            root_nodes = self._tree_manager.root_nodes()
-                            try:
-                                rightmost_sibling = root_nodes.exclude(pk=self.pk).order_by('-' + opts.tree_id_attr)[0]
-                                self._tree_manager._move_node(self, rightmost_sibling, 'right', save=False)
-                            except IndexError:
-                                pass
+                        if right_sibling:
+                            self._tree_manager._move_node(self, right_sibling, 'left', save=False)
                         else:
-                            self._tree_manager._move_node(self, parent, 'last-child', save=False)
+                            # Default movement
+                            if parent_id is None:
+                                root_nodes = self._tree_manager.root_nodes()
+                                try:
+                                    rightmost_sibling = root_nodes.exclude(pk=self.pk).order_by('-' + opts.tree_id_attr)[0]
+                                    self._tree_manager._move_node(self, rightmost_sibling, 'right', save=False)
+                                except IndexError:
+                                    pass
+                            else:
+                                self._tree_manager._move_node(self, parent, 'last-child', save=False)
 
-                    if parent_id is not None and update_cached_parent:
-                        # Update rght of cached parent
-                        right_shift = 2 * (self.get_descendant_count() + 1)
-                        self._tree_manager._post_insert_update_cached_parent_right(parent, right_shift)
-                finally:
-                    # Make sure the new parent is always
-                    # restored on the way out in case of errors.
+                        if parent_id is not None and update_cached_parent:
+                            # Update rght of cached parent
+                            right_shift = 2 * (self.get_descendant_count() + 1)
+                            self._tree_manager._post_insert_update_cached_parent_right(parent, right_shift)
+                    finally:
+                        # Make sure the new parent is always
+                        # restored on the way out in case of errors.
+                        opts.set_raw_field_value(self, opts.parent_attr, parent_id)
+                else:
                     opts.set_raw_field_value(self, opts.parent_attr, parent_id)
             else:
-                opts.set_raw_field_value(self, opts.parent_attr, parent_id)
-        else:
-            # new node, do an insert
-            if (getattr(self, opts.left_attr) and getattr(self, opts.right_attr)):
-                # This node has already been set up for insertion.
-                pass
-            else:
-                parent = getattr(self, opts.parent_attr)
-
-                right_sibling = None
-                # if we're inside delay_mptt_updates, don't do queries to find sibling position.
-                # instead, do default insertion. correct positions will be found during partial rebuild later.
-                # *unless* this is a root node. (as update tracking doesn't handle re-ordering of trees.)
-                if do_updates or parent is None:
-                    if opts.order_insertion_by:
-                        right_sibling = opts.get_ordered_insertion_target(self, parent)
-
-                if right_sibling:
-                    self.insert_at(right_sibling, 'left', allow_existing_pk=True)
-
-                    if parent:
-                        # since we didn't insert into parent, we have to update parent.rght
-                        # here instead of in TreeManager.insert_node()
-                        right_shift = 2 * (self.get_descendant_count() + 1)
-                        self._tree_manager._post_insert_update_cached_parent_right(parent, right_shift)
+                # new node, do an insert
+                if (getattr(self, opts.left_attr) and getattr(self, opts.right_attr)):
+                    # This node has already been set up for insertion.
+                    pass
                 else:
-                    # Default insertion
-                    self.insert_at(parent, position='last-child', allow_existing_pk=True)
-        try:
-            super(MPTTModel, self).save(*args, **kwargs)
-        finally:
-            if collapse_old_tree is not None:
-                self._tree_manager._create_tree_space(collapse_old_tree, -1)
+                    parent = getattr(self, opts.parent_attr)
 
-        self._mptt_saved = True
-        opts.update_mptt_cached_fields(self)
+                    right_sibling = None
+                    # if we're inside delay_mptt_updates, don't do queries to find sibling position.
+                    # instead, do default insertion. correct positions will be found during partial rebuild later.
+                    # *unless* this is a root node. (as update tracking doesn't handle re-ordering of trees.)
+                    if do_updates or parent is None:
+                        if opts.order_insertion_by:
+                            right_sibling = opts.get_ordered_insertion_target(self, parent)
+
+                    if right_sibling:
+                        self.insert_at(right_sibling, 'left', allow_existing_pk=True)
+
+                        if parent:
+                            # since we didn't insert into parent, we have to update parent.rght
+                            # here instead of in TreeManager.insert_node()
+                            right_shift = 2 * (self.get_descendant_count() + 1)
+                            self._tree_manager._post_insert_update_cached_parent_right(parent, right_shift)
+                    else:
+                        # Default insertion
+                        self.insert_at(parent, position='last-child', allow_existing_pk=True)
+            try:
+                super(MPTTModel, self).save(*args, **kwargs)
+            finally:
+                if collapse_old_tree is not None:
+                    self._tree_manager._create_tree_space(collapse_old_tree, -1)
+
+            self._mptt_saved = True
+            opts.update_mptt_cached_fields(self)
+        # try:
+        #     if transaction.is_managed():
+        _save()
+        #     else:
+        #         with transaction.commit_on_success():
+        #             _save()
+        # except Exception, e:
+        #     raise
+
 
     def delete(self, *args, **kwargs):
         tree_width = (self._mpttfield('right') -

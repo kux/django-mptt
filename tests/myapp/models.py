@@ -6,16 +6,7 @@ import mptt
 from mptt.models import MPTTModel, TreeForeignKey
 from mptt.managers import TreeManager
 
-try:
-    from django.utils.encoding import python_2_unicode_compatible
-except ImportError:
-    from django.utils import six
-
-    def python_2_unicode_compatible(klass):
-        if not six.PY3:
-            klass.__unicode__ = klass.__str__
-            klass.__str__ = lambda self: self.__unicode__().encode('utf-8')
-        return klass
+from django.utils.encoding import python_2_unicode_compatible
 
 
 class CustomTreeManager(TreeManager):

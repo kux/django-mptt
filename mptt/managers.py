@@ -572,6 +572,7 @@ class TreeManager(models.Manager):
         qs = self.get_query_set()
         max_tree_id = list(qs.aggregate(Max(self.tree_id_attr)).values())[0]
         max_tree_id = max_tree_id or 0
+        # print max_tree_id
         return max_tree_id + 1
 
     def _inter_tree_move_and_close_gap(self, node, level_change,
