@@ -737,7 +737,7 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         appropriate position to maintain ordering by the specified field.
         """
         def _save():
-            # len(self.__class__.objects.select_for_update())
+            len(self.__class__.objects.select_for_update())
             do_updates = self.__class__._mptt_updates_enabled
             track_updates = self.__class__._mptt_is_tracking
             opts = self._mptt_meta
@@ -871,14 +871,12 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
 
             self._mptt_saved = True
             opts.update_mptt_cached_fields(self)
-        # try:
-        #     if transaction.is_managed():
-        _save()
-        #     else:
-        #         with transaction.commit_on_success():
-        #             _save()
-        # except Exception, e:
-        #     raise
+
+        if transaction.is_managed():
+            _save()
+        else:
+            with transaction.commit_on_success():
+                _save()
 
 
     def delete(self, *args, **kwargs):
